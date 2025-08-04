@@ -1,0 +1,14 @@
+# VS Code
+.vscode/
+.history/
+*.code-workspace
+
+# Byte-compiled / optimized files
+__pycache__/
+*.pyc
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
