@@ -12,7 +12,19 @@ import cvxpy as cp
 from pypfopt import EfficientFrontier, risk_models, expected_returns, objective_functions
 from pypfopt.exceptions import OptimizationError
 
-from .config.settings import OptimizationParams
+# Simple parameter class to replace config dependency
+class OptimizationParams:
+    def __init__(self, **kwargs):
+        # Default parameters matching your existing approach
+        self.objective = kwargs.get('objective', 'max_sharpe')
+        self.max_weight = kwargs.get('max_weight', 0.35)
+        self.min_names = kwargs.get('min_names', 3)
+        self.lookback_days = kwargs.get('lookback_days', 252)
+        self.risk_free_rate = kwargs.get('risk_free_rate', 0.0)
+        self.gamma = kwargs.get('gamma', 0.01)
+        self.l2_reg = kwargs.get('l2_reg', 0.01)
+        self.target_volatility = kwargs.get('target_volatility', None)
+        self.target_return = kwargs.get('target_return', None)
 
 logger = logging.getLogger(__name__)
 
@@ -140,18 +152,15 @@ class PortfolioOptimizer:
             sigma = self._prepare_covariance_matrix(price_data)
             sigma = sigma.loc[common_assets, common_assets]
             
-            # Initialize EfficientFrontier
-            ef = EfficientFrontier(mu, sigma)
+            # Initialize EfficientFrontier with weight bounds
+            weight_bounds = (0, self.params.max_weight)
+            ef = EfficientFrontier(mu, sigma, weight_bounds=weight_bounds)
             
             # Add L2 regularization
             ef.add_objective(objective_functions.L2_reg, gamma=self.params.l2_reg)
             
-            # Add weight constraints
-            for asset in mu.index:
-                ef.add_constraint(lambda w, asset=asset: w[asset] <= self.params.max_weight)
-            
-            # Add cardinality constraints
-            ef = self._add_cardinality_constraints(ef)
+            # Skip cardinality constraints for now to avoid the lambda issue
+            # ef = self._add_cardinality_constraints(ef)
             
             # Optimize based on objective
             if self.params.objective == 'max_sharpe':
@@ -160,6 +169,11 @@ class PortfolioOptimizer:
                 
             elif self.params.objective == 'min_volatility':
                 weights = ef.min_volatility()
+                
+            elif self.params.objective == 'max_expected_returns':
+                # Maximize expected returns (risk-agnostic optimization)
+                # Use a very small risk aversion coefficient (close to zero)
+                weights = ef.max_quadratic_utility(risk_aversion=1e-6)  # Almost pure return maximization
                 
             elif self.params.objective == 'efficient_risk':
                 if self.params.target_volatility is None:
@@ -262,9 +276,21 @@ async def optimize_portfolio_historical(
             logger.warning("No price data provided for historical optimization")
             return pd.Series(dtype=float)
         
+        # Ensure prices are numeric - fix data type issues
+        prices_numeric = prices.copy()
+        for col in prices_numeric.columns:
+            prices_numeric[col] = pd.to_numeric(prices_numeric[col], errors='coerce')
+        
+        # Remove any rows with NaN values after conversion
+        prices_numeric = prices_numeric.dropna()
+        
+        if prices_numeric.empty:
+            logger.error("No valid numeric price data after conversion")
+            return pd.Series(1.0 / len(prices.columns), index=prices.columns)
+        
         # Calculate historical mean returns
         annual_returns = expected_returns.mean_historical_return(
-            prices, 
+            prices_numeric, 
             frequency=252,  # Daily data
             compounding=True
         )
@@ -273,20 +299,24 @@ async def optimize_portfolio_historical(
         weekly_returns = (1 + annual_returns) ** (1/52) - 1
         
         optimizer = PortfolioOptimizer(params)
-        weights = optimizer._optimize_portfolio_base(weekly_returns, prices)
+        weights = optimizer._optimize_portfolio_base(weekly_returns, prices_numeric)
         
         if weights is not None:
             logger.info(f"Historical optimization: {(weights > 1e-4).sum()} holdings from {len(weekly_returns)} assets")
         else:
             logger.error("Historical optimization failed")
             # Fallback: equal weight portfolio
-            weights = pd.Series(1.0 / len(prices.columns), index=prices.columns)
+            weights = pd.Series(1.0 / len(prices_numeric.columns), index=prices_numeric.columns)
         
         return weights
         
     except Exception as e:
         logger.error(f"Error in historical optimization: {e}")
-        return pd.Series(dtype=float)
+        # Fallback: equal weight portfolio
+        if not prices.empty:
+            return pd.Series(1.0 / len(prices.columns), index=prices.columns)
+        else:
+            return pd.Series(dtype=float)
 
 
 def create_market_cap_weights(

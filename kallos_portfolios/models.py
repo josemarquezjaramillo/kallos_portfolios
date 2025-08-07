@@ -126,7 +126,7 @@ async def get_available_models_for_date(
         result = await session.execute(query, {
             'model_type': model_type,
             'coin_ids': coin_ids,
-            'model_year': model_year,
+            'model_year': str(model_year),  # Convert to string for database compatibility
             'model_quarter': model_quarter,
             'target_date': target_date
         })
@@ -187,14 +187,34 @@ class ModelManager:
         possible_extensions = ['.pt', '.pkl', '.joblib', '.darts']
         model_path = None
         
+        # First try flat directory structure
         for ext in possible_extensions:
             candidate = self.model_dir / f"{model_name}{ext}"
             if candidate.exists():
                 model_path = candidate
                 break
         
-        # Scaler should have the _scaler.pkl suffix
+        # If not found, try subdirectory structure (coin_id subdirectories)
+        if model_path is None:
+            # Extract coin_id from model name (e.g., 'gru_bitcoin_2023_Q2_7D_customloss' -> 'bitcoin')
+            parts = model_name.split('_')
+            if len(parts) >= 2:
+                coin_id = parts[1]  # Assuming format: gru_bitcoin_...
+                
+                for ext in possible_extensions:
+                    candidate = self.model_dir / coin_id / f"{model_name}{ext}"
+                    if candidate.exists():
+                        model_path = candidate
+                        break
+        
+        # Scaler path - try both flat and subdirectory structure
         scaler_path = self.model_dir / f"{model_name}_scaler.pkl"
+        if not scaler_path.exists():
+            # Try subdirectory structure
+            parts = model_name.split('_')
+            if len(parts) >= 2:
+                coin_id = parts[1]
+                scaler_path = self.model_dir / coin_id / f"{model_name}_scaler.pkl"
         
         return model_path, scaler_path if scaler_path.exists() else None
     

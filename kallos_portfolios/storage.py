@@ -20,10 +20,40 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
-from .config.settings import settings, OptimizationParams
+# Import simple config pattern
+from json import loads
 from .exceptions import DataValidationError, InsufficientDataError, DatabaseError
 
+# Simple parameter class to replace config dependency
+class OptimizationParams:
+    def __init__(self, **kwargs):
+        self.objective = kwargs.get('objective', 'max_sharpe')
+        self.max_weight = kwargs.get('max_weight', 0.35)
+        self.min_names = kwargs.get('min_names', 3)
+        self.lookback_days = kwargs.get('lookback_days', 252)
+        self.risk_free_rate = kwargs.get('risk_free_rate', 0.0)
+        self.gamma = kwargs.get('gamma', 0.01)
+        self.l2_reg = kwargs.get('l2_reg', 0.01)
+        self.target_volatility = kwargs.get('target_volatility', None)
+        self.target_return = kwargs.get('target_return', None)
+
 logger = logging.getLogger(__name__)
+
+# Simple function to load database config using your existing pattern
+def load_db_config():
+    """Load database configuration using the existing pattern"""
+    try:
+        db_kwargs = loads(open('/home/jlmarquez11/kallos/kallos_runner/.env').read())
+        return db_kwargs
+    except FileNotFoundError:
+        logger.warning("Database config file not found, using defaults")
+        return {
+            'postgres_user': 'postgres',
+            'postgres_password': 'password', 
+            'postgres_host': 'localhost',
+            'postgres_port': 5432,
+            'postgres_db': 'kallos'
+        }
 
 # SQLAlchemy models
 Base = declarative_base()
@@ -165,18 +195,21 @@ def init_async_db(database_url: Optional[str] = None):
     """
     global async_engine, AsyncSessionLocal
     
-    url = database_url or settings.database_url
+    # Use simple config loading
+    if not database_url:
+        db_config = load_db_config()
+        database_url = f"postgresql+asyncpg://{db_config['postgres_user']}:{db_config['postgres_password']}@{db_config['postgres_host']}:{db_config['postgres_port']}/{db_config['postgres_db']}"
     
     async_engine = create_async_engine(
-        url,
-        # Connection pooling configuration
-        pool_size=settings.db_pool_size,
-        max_overflow=settings.db_max_overflow,
+        database_url,
+        # Connection pooling configuration with simple defaults
+        pool_size=10,
+        max_overflow=20,
         pool_pre_ping=True,           # Validate connections before use
         pool_recycle=3600,            # Recycle connections every hour
         pool_timeout=30,              # Timeout for getting connection from pool
-        poolclass=QueuePool,          # Use QueuePool for connection management
-        echo=settings.log_level == 'DEBUG',
+        # Note: QueuePool is not compatible with async engines, using default async pool
+        echo=False,                   # Simple default
         # Additional connection args
         connect_args={
             "server_settings": {
@@ -201,7 +234,7 @@ def init_async_db(database_url: Optional[str] = None):
         expire_on_commit=False
     )
     
-    logger.info(f"Initialized async database engine with connection pooling: {url}")
+    logger.info(f"Initialized async database engine with connection pooling: {database_url}")
 
 
 async def check_database_health(database_url: Optional[str] = None) -> bool:
@@ -464,6 +497,12 @@ async def load_prices_for_period(
         prices_df['date'] = pd.to_datetime(prices_df['timestamp']).dt.date
         prices_df.set_index('date', inplace=True)
         
+        # Ensure all numeric columns are float64 (not Decimal)
+        numeric_columns = ['price', 'volume', 'market_cap', 'close']
+        for col in numeric_columns:
+            if col in prices_df.columns:
+                prices_df[col] = pd.to_numeric(prices_df[col], errors='coerce').astype('float64')
+        
         # Use close price if available, otherwise use price
         price_column = 'close' if 'close' in prices_df.columns and not prices_df['close'].isna().all() else 'price'
         
@@ -530,100 +569,266 @@ async def load_prices_for_period(
         raise DatabaseError(f"Failed to load price data: {str(e)}") from e
 
 
-async def fetch_monthly_universe(
-    session: AsyncSession, 
-    target_date: date,
-    min_universe_size: int = 3
-) -> List[str]:
+async def save_portfolio_run(
+    session: AsyncSession,
+    run_id: str,
+    start_date: date,
+    end_date: date,
+    strategy_name: str,
+    assets: List[str],
+    final_value: float,
+    total_return: float,
+    sharpe_ratio: float,
+    volatility: float,
+    max_drawdown: float,
+    metadata: dict = None
+) -> int:
     """
-    Fetch investable universe with validation and error handling.
-    
-    Returns coin_ids that directly match the 'id' column in daily_market_data.
+    Save portfolio run results to database.
     
     Args:
         session: Database session
-        target_date: Date for universe selection
-        min_universe_size: Minimum required universe size
+        run_id: Unique identifier for this portfolio run
+        start_date: Portfolio start date
+        end_date: Portfolio end date
+        strategy_name: Name of the strategy used
+        assets: List of assets in portfolio
+        final_value: Final portfolio value
+        total_return: Total return percentage
+        sharpe_ratio: Portfolio Sharpe ratio
+        volatility: Portfolio volatility
+        max_drawdown: Maximum drawdown
+        metadata: Additional metadata as dict
         
     Returns:
-        List of coin_ids for the investable universe
-        
-    Raises:
-        InsufficientDataError: If universe is too small or not found
-        DataValidationError: If data validation fails
+        Portfolio run ID from database
     """
     try:
         query = text("""
-            SELECT coin_id, initial_market_cap_at_rebalance, initial_weight_at_rebalance
-            FROM public.index_monthly_constituents 
-            WHERE period_start_date = (
-                SELECT MAX(period_start_date) 
-                FROM public.index_monthly_constituents 
-                WHERE period_start_date <= :target_date
-            )
-            ORDER BY initial_market_cap_at_rebalance DESC
+            INSERT INTO portfolio_runs (
+                run_id, start_date, end_date, strategy_name, assets,
+                final_value, total_return, sharpe_ratio, volatility, max_drawdown,
+                metadata, created_at
+            ) VALUES (
+                :run_id, :start_date, :end_date, :strategy_name, :assets,
+                :final_value, :total_return, :sharpe_ratio, :volatility, :max_drawdown,
+                :metadata, NOW()
+            ) 
+            ON CONFLICT (run_id, strategy_name) 
+            DO UPDATE SET 
+                start_date = EXCLUDED.start_date,
+                end_date = EXCLUDED.end_date,
+                assets = EXCLUDED.assets,
+                final_value = EXCLUDED.final_value,
+                total_return = EXCLUDED.total_return,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                volatility = EXCLUDED.volatility,
+                max_drawdown = EXCLUDED.max_drawdown,
+                metadata = EXCLUDED.metadata,
+                created_at = NOW()
+            RETURNING id
         """)
         
-        result = await session.execute(query, {'target_date': target_date})
-        data = result.fetchall()
+        # Convert metadata to JSON string for PostgreSQL JSONB
+        import json
+        metadata_json = json.dumps(metadata) if metadata is not None else None
         
-        if not data:
-            raise InsufficientDataError(f"No universe data found for date {target_date}")
+        result = await session.execute(query, {
+            'run_id': run_id,
+            'start_date': start_date,
+            'end_date': end_date,
+            'strategy_name': strategy_name,
+            'assets': assets,
+            'final_value': final_value,
+            'total_return': total_return,
+            'sharpe_ratio': sharpe_ratio,
+            'volatility': volatility,
+            'max_drawdown': max_drawdown,
+            'metadata': metadata_json
+        })
         
-        # coin_id from index_monthly_constituents should match 'id' in daily_market_data
-        universe = [row[0] for row in data]  # These are coin_ids
-        market_caps = [row[1] for row in data]
-        weights = [row[2] for row in data]
+        portfolio_run_id = result.scalar()
+        await session.commit()
         
-        # Validate universe size
-        if len(universe) < min_universe_size:
-            raise InsufficientDataError(
-                f"Universe too small: {len(universe)} < {min_universe_size} required"
-            )
-        
-        logger.info(f"Retrieved universe of {len(universe)} coin IDs for {target_date}")
-        return universe
-        
-    except Exception as e:
-        if isinstance(e, (InsufficientDataError, DataValidationError)):
-            raise
-        logger.error(f"Unexpected error fetching universe: {e}")
-        raise DataValidationError(f"Failed to fetch universe: {str(e)}") from e
-        
-        result = await session.execute(query, {'target_date': target_date})
-        data = result.fetchall()
-        
-        if not data:
-            raise InsufficientDataError(f"No universe data found for date {target_date}")
-        
-        universe = [row[0] for row in data]
-        market_caps = [row[1] for row in data]
-        weights = [row[2] for row in data]
-        
-        # Validate universe size
-        if len(universe) < min_universe_size:
-            raise InsufficientDataError(
-                f"Universe too small: {len(universe)} < {min_universe_size} required"
-            )
-        
-        # Validate market cap data
-        if any(mc is None or mc <= 0 for mc in market_caps):
-            invalid_coins = [universe[i] for i, mc in enumerate(market_caps) if mc is None or mc <= 0]
-            raise DataValidationError(f"Invalid market cap data for coins: {invalid_coins}")
-        
-        # Validate weights sum to reasonable total
-        total_weight = sum(w for w in weights if w is not None)
-        if not (0.8 <= total_weight <= 1.2):  # Allow some tolerance
-            logger.warning(f"Universe weights sum to {total_weight:.3f}, expected ~1.0")
-        
-        logger.info(f"Retrieved universe of {len(universe)} coins for {target_date}")
-        return universe
+        logger.info(f"Saved portfolio run {run_id} to database with ID {portfolio_run_id}")
+        return portfolio_run_id
         
     except Exception as e:
-        if isinstance(e, (InsufficientDataError, DataValidationError)):
-            raise
-        logger.error(f"Unexpected error fetching universe: {e}")
-        raise DatabaseError(f"Failed to fetch universe: {str(e)}") from e
+        await session.rollback()
+        logger.error(f"Failed to save portfolio run {run_id}: {e}")
+        raise DatabaseError(f"Failed to save portfolio run: {str(e)}") from e
+
+
+async def save_portfolio_weights(
+    session: AsyncSession,
+    portfolio_run_id: int,
+    rebalance_date: date,
+    weights: pd.Series
+) -> None:
+    """
+    Save portfolio weights for a specific rebalancing date.
+    
+    Args:
+        session: Database session
+        portfolio_run_id: Portfolio run ID from database
+        rebalance_date: Date of rebalancing
+        weights: Portfolio weights as pandas Series
+    """
+    try:
+        # Insert weights for each asset
+        for asset, weight in weights.items():
+            query = text("""
+                INSERT INTO portfolio_weights (
+                    portfolio_run_id, rebalance_date, asset, weight
+                ) VALUES (
+                    :portfolio_run_id, :rebalance_date, :asset, :weight
+                )
+                ON CONFLICT (portfolio_run_id, rebalance_date, asset) 
+                DO UPDATE SET weight = EXCLUDED.weight
+            """)
+            
+            await session.execute(query, {
+                'portfolio_run_id': portfolio_run_id,
+                'rebalance_date': rebalance_date,
+                'asset': asset,
+                'weight': float(weight)
+            })
+        
+        await session.commit()
+        logger.info(f"Saved {len(weights)} weights for portfolio {portfolio_run_id} on {rebalance_date}")
+        
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Failed to save portfolio weights: {e}")
+        raise DatabaseError(f"Failed to save portfolio weights: {str(e)}") from e
+
+
+async def save_portfolio_returns(
+    session: AsyncSession,
+    portfolio_run_id: int,
+    returns_series: pd.Series
+) -> None:
+    """
+    Save daily portfolio returns.
+    
+    Args:
+        session: Database session
+        portfolio_run_id: Portfolio run ID from database
+        returns_series: Daily returns as pandas Series with date index
+    """
+    try:
+        # Convert returns to list of dicts for bulk insert
+        returns_data = []
+        for return_date, return_value in returns_series.items():
+            # Convert date index to proper date object
+            if hasattr(return_date, 'date'):
+                date_obj = return_date.date()
+            else:
+                date_obj = return_date
+                
+            returns_data.append({
+                'portfolio_run_id': portfolio_run_id,
+                'date': date_obj,
+                'return_value': float(return_value)
+            })
+        
+        if returns_data:
+            # Use executemany for bulk insert
+            query = text("""
+                INSERT INTO portfolio_returns (portfolio_run_id, date, return_value)
+                VALUES (:portfolio_run_id, :date, :return_value)
+                ON CONFLICT (portfolio_run_id, date) 
+                DO UPDATE SET return_value = EXCLUDED.return_value
+            """)
+            
+            await session.execute(query, returns_data)
+            await session.commit()
+            
+            logger.info(f"Saved {len(returns_data)} daily returns for portfolio {portfolio_run_id}")
+        
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Failed to save portfolio returns: {e}")
+        raise DatabaseError(f"Failed to save portfolio returns: {str(e)}") from e
+
+
+async def fetch_monthly_universes(
+    session: AsyncSession, 
+    start_date: date,
+    end_date: date
+) -> List[str]:
+    
+    query = text("""
+        SELECT period_start_date as date, coin_id
+        FROM public.index_monthly_constituents 
+        WHERE period_start_date >= :start_date
+        AND period_start_date <= :end_date
+        ORDER BY period_start_date ASC, initial_market_cap_at_rebalance DESC
+    """)
+
+    result = await session.execute(query, {'start_date': start_date, 'end_date': end_date})
+    data = result.fetchall()
+    if not data:
+        raise InsufficientDataError(f"No universe data found for date {start_date} and {end_date}")
+    else:
+        df = pd.DataFrame(data, columns=['date', 'coin_id'])
+        return df
+    
+
+async def fetch_model_definitions(
+    session: AsyncSession, 
+    universes_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Fetch model training data for coins in universe DataFrame where universe dates
+    fall within the model's test period.
+    
+    Args:
+        session: Database session
+        universes_df: DataFrame with 'date' and 'coin_id' columns
+        
+    Returns:
+        DataFrame with model training data
+    """
+    if universes_df.empty:
+        raise ValueError("Universe DataFrame cannot be empty")    
+    
+    query = text("""
+        SELECT DISTINCT
+            mtv.model,
+            mtv.coin_id,
+            mtv.year_end,
+            mtv.quarter_end,
+            mtv.train_date_end,
+            mtv.test_start_date,
+            mtv.test_end_date,
+            mtv.study_name,
+            mtv.num_trials,
+            mtv.best_rmse,
+            mtv.best_da,
+            mtv.avg_rmse,
+            mtv.avg_da
+        FROM public.model_train_view mtv
+        INNER JOIN (VALUES {}) AS u(universe_date, universe_coin_id) 
+            ON mtv.coin_id = u.universe_coin_id
+            AND u.universe_date::date BETWEEN mtv.test_start_date AND mtv.test_end_date
+        ORDER BY mtv.coin_id, mtv.test_start_date
+    """.format(','.join([f"('{row.date}', '{row.coin_id}')" for _, row in universes_df.iterrows()])))
+    
+    result = await session.execute(query)
+    data = result.fetchall()
+    
+    if not data:
+        raise InsufficientDataError(f"No model training data found matching universe criteria")
+    
+    df = pd.DataFrame(data, columns=[
+        'model', 'coin_id', 'year_end', 'quarter_end', 
+        'train_date_end', 'test_start_date', 'test_end_date',
+        'study_name', 'num_trials', 'best_rmse', 'best_da', 
+        'avg_rmse', 'avg_da'
+    ])
+    df['study_name'] = df['study_name'].str.strip()
+    return df
 
 
 # Weight storage operations

@@ -16,6 +16,48 @@ from .storage import load_prices_for_period, fetch_monthly_universe
 logger = logging.getLogger(__name__)
 
 
+def generate_weekly_rebalance_dates(start_date: date, end_date: date) -> List[date]:
+    """
+    Generate weekly rebalancing dates (first business day of each week, preferably Monday).
+    
+    Args:
+        start_date: Portfolio start date
+        end_date: Portfolio end date
+        
+    Returns:
+        List of weekly rebalancing dates
+    """
+    rebalance_dates = []
+    current_date = start_date
+    
+    while current_date <= end_date:
+        # Find the Monday of the current week (Monday = 0)
+        days_to_monday = current_date.weekday()  # 0=Monday, 1=Tuesday, etc.
+        monday_of_week = current_date - timedelta(days=days_to_monday)
+        
+        # If the Monday is before our start date, move to next Monday
+        if monday_of_week < start_date:
+            monday_of_week += timedelta(days=7)
+        
+        # Find first business day of that week (Monday or next business day)
+        week_start = monday_of_week
+        week_end = monday_of_week + timedelta(days=6)  # Sunday
+        
+        # Get business days for that week
+        business_days = pd.bdate_range(start=week_start, end=week_end, freq='B')
+        
+        if len(business_days) > 0:
+            first_business_day = business_days[0].date()
+            
+            if first_business_day <= end_date and first_business_day not in rebalance_dates:
+                rebalance_dates.append(first_business_day)
+        
+        # Move to next week
+        current_date = monday_of_week + timedelta(days=7)
+    
+    logger.info(f"Generated {len(rebalance_dates)} weekly rebalance dates from {start_date} to {end_date}")
+    return rebalance_dates
+
 def generate_monthly_rebalance_dates(start_date: date, end_date: date) -> List[date]:
     """
     Generate monthly rebalancing dates (first business day of each month).
@@ -274,15 +316,21 @@ def calculate_returns_matrix(prices: pd.DataFrame, return_type: str = 'simple') 
     if prices.empty:
         return pd.DataFrame()
     
+    # Ensure all prices are float64 before calculating returns
+    prices_float = prices.copy()
+    for col in prices_float.columns:
+        prices_float[col] = pd.to_numeric(prices_float[col], errors='coerce').astype('float64')
+    
     if return_type == 'simple':
-        returns = prices.pct_change()
+        returns = prices_float.pct_change()
     elif return_type == 'log':
-        returns = np.log(prices / prices.shift(1))
+        returns = np.log(prices_float / prices_float.shift(1))
     else:
         raise ValueError(f"Unknown return type: {return_type}")
     
-    # Drop first row (NaN from pct_change)
+    # Drop first row (NaN from pct_change) and ensure float64 dtype
     returns = returns.dropna(how='all')
+    returns = returns.astype('float64')
     
     logger.info(f"Calculated {return_type} returns: {len(returns.columns)} symbols, {len(returns)} periods")
     return returns

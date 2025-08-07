@@ -1,53 +1,324 @@
-# 🚀 Kallos Portfolios
+# Kallos Portfolios
 
-**Cryptocurrency Portfolio Construction & Backtesting Framework**
+**Cryptocurrency Portfolio Construction and Backtesting Framework**
 
-A sophisticated three-strategy portfolio optimization system that integrates **quarterly-trained machine learning models** with traditional portfolio optimization techniques for cryptocurrency investments. The system seamlessly integrates with existing database infrastructure and implements **temporal model selection** for automated quarterly model management.
+A comprehensive portfolio optimization system that implements multiple return forecasting strategies for cryptocurrency investments. The framework provides a modular architecture for comparing GRU neural network predictions against traditional historical methods and market-weighted benchmarks.
 
-## 🎯 Overview
+## Overview
 
-Kallos Portfolios implements a comprehensive **three-strategy comparison framework** with **database schema alignment** and **temporal model management**:
+Kallos Portfolios is designed as a modular framework that enables systematic comparison of different portfolio construction approaches. The system implements three distinct strategies:
 
-1. **GRU-Optimized Portfolio**: Uses quarterly-trained GRU neural networks with automatic model selection
-2. **Historical Mean Optimized Portfolio**: Traditional mean-variance optimization benchmark  
-3. **Market Cap Weighted Portfolio**: Passive index benchmark using actual market cap data
+1. **GRU-based Portfolio Optimization**: Utilizes neural network return predictions for forward-looking portfolio construction
+2. **Historical Returns Benchmark**: Implements traditional mean-variance optimization using historical return estimates
+3. **Market-weighted Benchmark**: Provides passive index comparison using market capitalization weights
 
-The system provides **seamless integration** with existing database schemas and **automated quarterly model rotation** for production-ready portfolio optimization.
+The framework emphasizes code reusability through inheritance-based architecture, eliminating duplication while maintaining strategy-specific customization capabilities.
 
-## 🔗 Database Integration
+## Architecture
 
-### **Existing Schema Compatibility**
-✅ **No database changes required** - works with your existing tables:
+### Core Package Structure
 
-- **`daily_market_data`**: Uses existing `id`, `timestamp`, `price` columns
-- **`daily_index_coin_contributions`**: Leverages actual market cap weights
-- **`index_monthly_constituents`**: Dynamic universe from existing index data
-- **`model_train_view`**: Automatic model discovery and selection
+The system is organized into specialized modules, each handling distinct aspects of the portfolio optimization workflow:
 
-### **Temporal Model Management**
-🕐 **Quarterly Model Selection**: Automatically selects the correct model based on dates
-- **Q1 2023 dates** → Uses models trained in **Q4 2022**
-- **Q2 2023 dates** → Uses models trained in **Q1 2023**
-- **Q3 2023 dates** → Uses models trained in **Q2 2023**
-
-### **Model Naming Convention**
 ```
-gru_bitcoin_2023_Q2_7D_customloss.pt
-gru_ethereum_2023_Q2_7D_customloss.pt
-gru_cardano_2023_Q2_7D_customloss.pt
+kallos_portfolios/
+├── simulators/           # Portfolio simulation engines
+├── analysis/            # Cross-strategy analysis tools
+├── evaluation.py        # Performance measurement and reporting
+├── storage.py          # Database operations and data persistence
+├── optimisers.py       # Portfolio optimization algorithms
+├── backtest.py         # Backtesting infrastructure
+├── models.py           # Machine learning model management
+├── datasets.py         # Data loading and preprocessing
+├── predictors.py       # Return forecasting implementations
+└── exceptions.py       # Custom exception definitions
 ```
 
-## 🏗️ Architecture
+### Module Interactions
 
-### Core Components
+The system follows a layered architecture where modules interact through well-defined interfaces:
 
-- **`storage.py`**: Database operations with `daily_market_data` integration
-- **`models.py`**: **Temporal model selection** and quarterly management
-- **`datasets.py`**: Coin-based data loading and monthly universe management
-- **`optimisers.py`**: Portfolio optimization with coin_id consistency
-- **`backtest.py`**: Vectorized backtesting engine using vectorbt
-- **`evaluation.py`**: Statistical analysis and hypothesis testing framework
-- **`main.py`**: **Python API** for complete portfolio workflows
+**Data Layer**: `storage.py` provides unified data access, supporting both historical price retrieval and portfolio result persistence. It abstracts database operations and ensures consistent data formatting across all modules.
+
+**Model Layer**: `models.py` handles machine learning model lifecycle management, including model discovery, loading, and prediction generation. `predictors.py` extends this with strategy-specific forecasting implementations.
+
+**Optimization Layer**: `optimisers.py` implements portfolio optimization algorithms, accepting expected return forecasts and producing optimal weight allocations using modern portfolio theory principles.
+
+**Simulation Layer**: The `simulators/` package contains the core simulation engines that orchestrate the complete workflow from data loading through performance evaluation.
+
+**Analysis Layer**: `evaluation.py` and the `analysis/` package provide comprehensive performance measurement, statistical testing, and comparative analysis capabilities.
+
+## Simulators Package
+
+### Base Simulator Architecture
+
+The simulators package implements an inheritance-based architecture that eliminates code duplication while maintaining flexibility for strategy-specific implementations.
+
+#### BasePortfolioSimulator
+
+The base simulator class provides shared functionality used by all portfolio strategies:
+
+**Universe Management**: Handles investable asset universe definition and temporal asset availability. The `get_assets_for_date()` method manages monthly universe updates and ensures consistent asset selection across strategies.
+
+**Portfolio Optimization**: Implements the complete optimization workflow through `optimize_portfolio()`, including covariance matrix estimation, constraint definition, and numerical optimization execution.
+
+**Performance Simulation**: The `simulate_performance()` method uses VectorBT for realistic backtesting, including transaction costs, rebalancing mechanics, and portfolio drift simulation.
+
+**Result Persistence**: Manages database storage of portfolio weights, daily returns, and performance metrics through the `save_results()` method.
+
+**Report Generation**: Coordinates with the evaluation module to produce QuantStats tearsheets and comprehensive performance reports.
+
+The base class defines the template method `get_expected_returns_for_date()` which subclasses must implement to provide strategy-specific return forecasts.
+
+#### GRUPortfolioSimulator
+
+Extends BasePortfolioSimulator to implement neural network-based return forecasting:
+
+**Prediction Management**: Loads and manages GRU model predictions from pre-computed datasets. Implements temporal matching to align predictions with rebalancing dates.
+
+**Data Validation**: Performs comprehensive validation of neural network outputs, including duplicate removal, outlier detection, and missing value handling.
+
+**Temporal Alignment**: Manages the mapping between rebalancing dates and available prediction dates, implementing fallback strategies for missing predictions.
+
+#### HistoricalPortfolioSimulator
+
+Extends BasePortfolioSimulator to implement traditional mean-reversion strategies:
+
+**Historical Return Calculation**: Uses PyPortfolioOpt to compute historical mean returns over configurable lookback periods. Supports multiple frequency conversions and compounding methodologies.
+
+**Data Quality Management**: Implements robust handling of missing historical data, including coverage requirements and data sufficiency checks.
+
+**Benchmark Implementation**: Provides a direct comparison baseline that represents traditional quantitative portfolio management approaches.
+
+### Simulator Workflow Integration
+
+The simulators coordinate with other system modules through standardized interfaces:
+
+1. **Data Acquisition**: Simulators request price data from `storage.py` with specific date ranges and coverage requirements
+2. **Return Forecasting**: Each simulator implements strategy-specific forecasting through the `get_expected_returns_for_date()` method
+3. **Optimization Execution**: Simulators pass expected returns to `optimisers.py` for constraint-based optimization
+4. **Performance Evaluation**: Completed simulations integrate with `evaluation.py` for comprehensive performance analysis
+5. **Result Storage**: All results are persisted through `storage.py` using standardized schemas
+
+## Analysis Package
+
+### Three-Strategy Comparison Framework
+
+The analysis package provides sophisticated tools for systematic strategy comparison:
+
+**Statistical Testing**: Implements hypothesis testing for return differences, volatility comparisons, and risk-adjusted performance evaluation. Uses appropriate statistical tests for time series data.
+
+**Performance Attribution**: Decomposes portfolio performance into return forecasting quality, optimization efficiency, and execution effectiveness components.
+
+**Risk Analysis**: Provides comprehensive risk measurement including Value at Risk, Expected Shortfall, and drawdown analysis across all strategies.
+
+**Visualization**: Generates comparative visualizations including performance charts, risk-return scatter plots, and rolling performance analysis.
+
+### Report Generation
+
+The analysis framework produces multiple output formats:
+
+**Individual Strategy Tearsheets**: Detailed QuantStats reports for each strategy providing comprehensive performance metrics, return distributions, and risk analysis.
+
+**Comparative Analysis Reports**: Side-by-side comparison documents highlighting relative performance, statistical significance of differences, and risk-adjusted metrics.
+
+**Statistical Summary**: Hypothesis testing results with appropriate statistical confidence levels and practical significance assessments.
+
+## Data Management
+
+### Storage Architecture
+
+The storage module provides a unified interface for all data operations:
+
+**Async Database Operations**: All database interactions use asyncio for non-blocking operations, enabling efficient concurrent data access.
+
+**Connection Management**: Implements connection pooling and automatic retry logic for robust database operations.
+
+**Schema Management**: Defines and maintains database schemas for portfolio runs, weights, returns, and performance metrics.
+
+**Data Validation**: Ensures data integrity through comprehensive validation before database persistence.
+
+### Price Data Management
+
+**Multi-Asset Support**: Handles price data for hundreds of cryptocurrency assets with different inception dates and data availability.
+
+**Coverage Requirements**: Implements configurable minimum data coverage requirements to ensure statistical validity.
+
+**Missing Data Handling**: Provides multiple strategies for handling missing price data including forward filling, interpolation, and exclusion.
+
+## Optimization Framework
+
+### Portfolio Optimization
+
+The optimization module implements modern portfolio theory with practical constraints:
+
+**Objective Functions**: Supports multiple optimization objectives including minimum variance, maximum Sharpe ratio, and maximum expected return.
+
+**Constraint Management**: Implements position limits, sector constraints, and turnover limitations for realistic portfolio construction.
+
+**Numerical Stability**: Uses robust optimization algorithms with fallback strategies for numerical edge cases.
+
+**Risk Model Integration**: Incorporates sophisticated risk models including factor-based and sample-based covariance estimation.
+
+### Parameter Configuration
+
+**OptimizationParams Class**: Provides structured configuration management for all optimization parameters including objectives, constraints, and numerical settings.
+
+**Validation**: Comprehensive parameter validation ensures optimization feasibility before execution.
+
+**Default Management**: Implements sensible defaults while allowing full customization for advanced users.
+
+## Performance Evaluation
+
+### Metrics Calculation
+
+The evaluation module provides comprehensive performance measurement:
+
+**Return-Based Metrics**: Total return, annualized return, volatility, and Sharpe ratio calculation with proper handling of compounding and frequency conversion.
+
+**Risk Metrics**: Maximum drawdown, Value at Risk, Expected Shortfall, and downside deviation measurement.
+
+**Advanced Analytics**: Skewness, kurtosis, tail ratio, and other higher-moment statistics for complete return distribution analysis.
+
+### Statistical Testing
+
+**Hypothesis Testing Framework**: Implements appropriate statistical tests for portfolio comparison including t-tests for return differences and F-tests for volatility comparison.
+
+**Multiple Comparison Correction**: Applies appropriate corrections for multiple hypothesis testing to maintain statistical validity.
+
+**Effect Size Analysis**: Measures practical significance in addition to statistical significance for meaningful strategy comparison.
+
+## Installation and Setup
+
+### Requirements
+
+The system requires Python 3.8+ with the following core dependencies:
+
+- pandas and numpy for data manipulation
+- asyncpg and sqlalchemy for database operations
+- vectorbt for backtesting infrastructure
+- quantstats for performance analysis
+- pypfopt for portfolio optimization
+- scikit-learn for statistical utilities
+
+### Database Configuration
+
+The system requires PostgreSQL database access with the following schema:
+
+**Portfolio Runs**: Stores high-level information about each portfolio simulation including strategy, date range, and summary performance metrics.
+
+**Portfolio Weights**: Maintains detailed weight allocations for each rebalancing date and asset combination.
+
+**Portfolio Returns**: Stores daily portfolio returns for detailed performance analysis and reporting.
+
+**Price Data**: Requires historical price data for all investable assets with consistent date formatting and proper handling of missing values.
+
+## Usage Examples
+
+### Basic Simulation Execution
+
+```python
+from kallos_portfolios.simulators import GRUPortfolioSimulator, HistoricalPortfolioSimulator
+from datetime import date
+
+# Load required data
+universe_df, rebalancing_dates, predictions_df = load_data()
+
+# Initialize GRU simulator
+gru_simulator = GRUPortfolioSimulator(
+    universe_df=universe_df,
+    rebalancing_dates=rebalancing_dates,
+    predictions_df=predictions_df,
+    objective='min_volatility'
+)
+
+# Run complete backtest
+run_id = await gru_simulator.run_complete_backtest()
+```
+
+### Strategy Comparison
+
+```python
+from kallos_portfolios.analysis import run_three_strategy_comparison
+from datetime import date
+
+# Compare all three strategies
+results = await run_three_strategy_comparison(
+    gru_portfolio_id=15,
+    historical_portfolio_id=16,
+    start_date=date(2022, 1, 3),
+    end_date=date(2022, 12, 26)
+)
+```
+
+### Custom Optimization Parameters
+
+```python
+from kallos_portfolios.optimisers import OptimizationParams
+
+# Define custom optimization parameters
+params = OptimizationParams(
+    objective='max_sharpe',
+    max_weight=0.25,        # Maximum 25% allocation per asset
+    min_weight=0.02,        # Minimum 2% allocation if included
+    turnover_limit=0.50     # Maximum 50% turnover per rebalancing
+)
+```
+
+## Development and Extension
+
+### Adding New Strategies
+
+The framework supports easy extension through the BasePortfolioSimulator interface:
+
+1. Inherit from BasePortfolioSimulator
+2. Implement the `get_expected_returns_for_date()` method
+3. Add any strategy-specific initialization in `__init__()`
+4. Register the new simulator in the simulators package `__init__.py`
+
+### Custom Optimization Objectives
+
+New optimization objectives can be added by extending the OptimizationParams class and implementing the corresponding optimization logic in the PortfolioOptimizer class.
+
+### Additional Analysis Tools
+
+The analysis package can be extended with additional comparison metrics, statistical tests, or visualization tools by adding modules to the analysis package.
+
+## Performance Considerations
+
+### Computational Efficiency
+
+The system implements several optimizations for large-scale portfolio analysis:
+
+**Vectorized Operations**: All numerical computations use pandas and numpy vectorization for optimal performance.
+
+**Database Optimization**: Implements connection pooling, batch operations, and optimized queries for efficient data access.
+
+**Memory Management**: Uses efficient data structures and implements proper cleanup to handle large datasets.
+
+**Parallel Processing**: Supports concurrent execution of independent operations including multiple strategy evaluation.
+
+### Scalability
+
+The architecture supports scaling to larger asset universes and longer backtesting periods:
+
+**Modular Design**: Independent modules can be optimized or replaced without affecting other system components.
+
+**Database Abstraction**: Storage layer can be adapted to different database systems or data sources.
+
+**Configuration Management**: Comprehensive parameter configuration enables tuning for different computational environments.
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome through GitHub pull requests. Please ensure all code follows the established architecture patterns and includes appropriate documentation and testing.
+
+## Support
+
+For questions, issues, or feature requests, please use the GitHub issue tracking system or contact the development team directly.
 
 ### Key Innovations
 

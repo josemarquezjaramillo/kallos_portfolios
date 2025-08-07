@@ -6,11 +6,11 @@ Implements comprehensive hypothesis testing and performance comparison framework
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import quantstats as qs
-from datetime import date
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +350,7 @@ def generate_quantstats_reports(
     output_dir: Path = None
 ) -> Dict[str, Path]:
     """
-    Generate QuantStats tearsheet reports for all strategies.
+    Generate QuantStats tearsheet reports for all strategies with proper naming.
     
     Args:
         strategy_returns: Dictionary of strategy return series
@@ -376,15 +376,29 @@ def generate_quantstats_reports(
             continue
         
         try:
-            report_path = output_dir / f"{strategy_name}_tearsheet.html"
+            # Create proper naming for tearsheets
+            if strategy_name == 'GRU_Portfolio':
+                tearsheet_name = 'GRU_Portfolio_tearsheet.html'
+                display_title = 'GRU Portfolio Strategy Performance Analysis'
+            elif strategy_name == 'Historical_Portfolio':
+                tearsheet_name = 'Naive_Portfolio_tearsheet.html'  # Renamed as requested
+                display_title = 'Naive Portfolio Strategy Performance Analysis'
+            elif strategy_name == 'Market_Weighted':
+                tearsheet_name = 'Market_Weighted_tearsheet.html'
+                display_title = 'Market Weighted Portfolio Performance Analysis'
+            else:
+                tearsheet_name = f'{strategy_name}_tearsheet.html'
+                display_title = f"{strategy_name.replace('_', ' ')} Strategy Performance Analysis"
+            
+            report_path = output_dir / tearsheet_name
             
             # Generate QuantStats report
             qs.reports.html(
                 returns,
                 benchmark=benchmark_returns if strategy_name != benchmark_strategy else None,
                 output=str(report_path),
-                title=f"{strategy_name} Strategy Performance Analysis",
-                download_filename=f"{strategy_name}_tearsheet.html"
+                title=display_title,
+                download_filename=tearsheet_name
             )
             
             report_paths[strategy_name] = report_path
@@ -610,15 +624,29 @@ async def run_complete_evaluation(
         # Perform hypothesis tests
         test_results = evaluator.perform_pairwise_hypothesis_tests()
         
-        # Generate QuantStats reports
+        # Generate QuantStats reports for individual strategies
         quantstats_reports = generate_quantstats_reports(
             strategy_returns, 
             benchmark_strategy, 
             output_dir
         )
         
-        # Generate comparison report
+        # Generate comprehensive comparison report
         comparison_report = create_strategy_comparison_report(evaluator, output_dir)
+        
+        # Save combined returns data
+        combined_returns = pd.DataFrame(strategy_returns)
+        combined_returns.to_csv(output_dir / "combined_returns.csv")
+        
+        # Save performance metrics
+        if not performance_metrics.empty:
+            performance_metrics.to_csv(output_dir / "performance_metrics.csv")
+        
+        # Save hypothesis test results
+        if test_results:
+            import json
+            with open(output_dir / "hypothesis_tests.json", 'w') as f:
+                json.dump(test_results, f, indent=2, default=str)
         
         logger.info("Complete portfolio evaluation finished successfully")
         
@@ -632,4 +660,284 @@ async def run_complete_evaluation(
         
     except Exception as e:
         logger.error(f"Error in complete evaluation: {e}")
+        return {'error': str(e)}
+
+
+async def load_market_weighted_returns(
+    start_date: date, 
+    end_date: date,
+    db_kwargs: Dict = None
+) -> pd.Series:
+    """
+    Load market-weighted portfolio returns from daily_crypto_index table.
+    
+    Args:
+        start_date: Start date for returns
+        end_date: End date for returns
+        db_kwargs: Database connection parameters
+        
+    Returns:
+        Series of daily market-weighted returns
+    """
+    from kallos_portfolios.storage import get_async_session
+    import sqlalchemy as sa
+    
+    try:
+        async with get_async_session() as session:
+            query = sa.text("""
+            SELECT 
+                trade_date,
+                index_value,
+                LAG(index_value) OVER (ORDER BY trade_date) AS prev_value
+            FROM daily_crypto_index 
+            WHERE trade_date BETWEEN :start_date AND :end_date
+            ORDER BY trade_date
+            """)
+            
+            result = await session.execute(query, {
+                'start_date': start_date,
+                'end_date': end_date
+            })
+            data = result.fetchall()
+            
+            if not data:
+                logger.warning(f"No market index data found between {start_date} and {end_date}")
+                return pd.Series(dtype=float, name='market_weighted_returns')
+            
+            # Convert to DataFrame with proper data type handling
+            rows = []
+            for row in data:
+                trade_date = row[0]
+                index_value = float(row[1]) if row[1] is not None else None  # Convert Decimal to float
+                prev_value = float(row[2]) if row[2] is not None else None   # Convert Decimal to float
+                rows.append({
+                    'trade_date': trade_date,
+                    'index_value': index_value,
+                    'prev_value': prev_value
+                })
+            
+            df = pd.DataFrame(rows)
+            df.set_index('trade_date', inplace=True)
+            
+            # Calculate daily returns, ensuring all operations are on float values
+            df['daily_return'] = ((df['index_value'] / df['prev_value']) - 1.0).fillna(0.0)
+            
+            # Create returns series with datetime index
+            returns = df['daily_return'].dropna()
+            returns.index = pd.to_datetime(returns.index)
+            returns.name = 'market_weighted_returns'
+            
+            # Ensure the series contains only float values
+            returns = returns.astype(float)
+            
+            logger.info(f"Loaded {len(returns)} market-weighted returns from {returns.index[0].date()} to {returns.index[-1].date()}")
+            
+            return returns
+            
+    except Exception as e:
+        logger.error(f"Error loading market-weighted returns: {e}")
+        return pd.Series(dtype=float, name='market_weighted_returns')
+
+
+async def load_portfolio_returns_by_id(portfolio_run_id: int) -> pd.Series:
+    """
+    Load portfolio returns using portfolio_runs.id.
+    
+    Args:
+        portfolio_run_id: The id from portfolio_runs table
+        
+    Returns:
+        Series of portfolio returns indexed by date
+    """
+    from kallos_portfolios.storage import get_async_session
+    import sqlalchemy as sa
+    
+    try:
+        async with get_async_session() as session:
+            query = sa.text("""
+            SELECT date, return_value
+            FROM portfolio_returns 
+            WHERE portfolio_run_id = :portfolio_id
+            ORDER BY date
+            """)
+            
+            result = await session.execute(query, {"portfolio_id": portfolio_run_id})
+            data = result.fetchall()
+            
+            if not data:
+                logger.warning(f"No portfolio returns found for portfolio_run_id: {portfolio_run_id}")
+                return pd.Series(dtype=float)
+            
+            # Convert to pandas Series
+            dates = [row[0] for row in data]
+            returns = [float(row[1]) for row in data]
+            
+            series = pd.Series(returns, index=dates)
+            series.index = pd.to_datetime(series.index)
+            series.name = f'portfolio_{portfolio_run_id}'
+            
+            logger.info(f"Loaded {len(series)} returns for portfolio_run_id: {portfolio_run_id}")
+            return series
+            
+    except Exception as e:
+        logger.error(f"Error loading portfolio returns for ID {portfolio_run_id}: {e}")
+        return pd.Series(dtype=float)
+
+
+async def load_portfolio_returns_by_run_id(run_id: str) -> pd.Series:
+    """
+    Load portfolio returns for a specific run ID.
+    
+    Args:
+        run_id: Portfolio run identifier
+        
+    Returns:
+        Series of daily portfolio returns
+    """
+    from kallos_portfolios.storage import get_async_session
+    import sqlalchemy as sa
+    
+    try:
+        async with get_async_session() as session:
+            # First get the portfolio_run_id
+            run_query = sa.text("""
+            SELECT id FROM portfolio_runs WHERE run_id = :run_id
+            """)
+            
+            run_result = await session.execute(run_query, {'run_id': run_id})
+            run_data = run_result.fetchone()
+            
+            if not run_data:
+                logger.warning(f"No portfolio run found for run_id: {run_id}")
+                return pd.Series(dtype=float, name=run_id)
+            
+            portfolio_run_id = run_data[0]
+            
+            # Load the returns
+            returns_query = sa.text("""
+            SELECT date, return_value
+            FROM portfolio_returns 
+            WHERE portfolio_run_id = :portfolio_run_id
+            ORDER BY date
+            """)
+            
+            returns_result = await session.execute(returns_query, {
+                'portfolio_run_id': portfolio_run_id
+            })
+            returns_data = returns_result.fetchall()
+            
+            if not returns_data:
+                logger.warning(f"No returns data found for run_id: {run_id}")
+                return pd.Series(dtype=float, name=run_id)
+            
+            # Convert to Series
+            returns_df = pd.DataFrame(returns_data, columns=['date', 'return_value'])
+            returns_df.set_index('date', inplace=True)
+            
+            # Convert Decimal to float and create series
+            returns_series = returns_df['return_value'].astype(float)
+            returns_series.name = run_id
+            
+            logger.info(f"Loaded {len(returns_series)} returns for {run_id} from {returns_series.index[0]} to {returns_series.index[-1]}")
+            
+            return returns_series
+            
+    except Exception as e:
+        logger.error(f"Error loading portfolio returns for {run_id}: {e}")
+        return pd.Series(dtype=float, name=run_id)
+
+
+async def create_three_strategy_comparison(
+    gru_portfolio_id: int,
+    historical_portfolio_id: int, 
+    start_date: date,
+    end_date: date,
+    output_dir: Path = None
+) -> Dict[str, Any]:
+    """
+    Create comprehensive 3-strategy comparison report using portfolio_runs.id values:
+    1. GRU Generated Portfolio (by portfolio_runs.id)
+    2. Naive Historical Portfolio (by portfolio_runs.id)
+    3. Market Weighted Portfolio (from daily_crypto_index table)
+    
+    Args:
+        gru_portfolio_id: portfolio_runs.id for GRU strategy
+        historical_portfolio_id: portfolio_runs.id for Historical strategy
+        start_date: Start date for comparison
+        end_date: End date for comparison
+        output_dir: Output directory for reports
+        
+    Returns:
+        Dictionary with complete evaluation results
+    """
+    try:
+        if output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = Path.cwd() / "reports" / f"three_strategy_comparison_{timestamp}"
+        
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"🚀 Starting Three-Strategy Portfolio Comparison")
+        logger.info(f"📊 GRU Portfolio ID: {gru_portfolio_id}")
+        logger.info(f"📊 Historical Portfolio ID: {historical_portfolio_id}")
+        logger.info(f"📊 Market Weighted Portfolio (from daily_crypto_index)")
+        logger.info(f"📅 Comparison Period: {start_date} to {end_date}")
+        
+        # Load all three strategy returns
+        strategy_returns = {}
+        
+        # 1. Load GRU portfolio returns by ID
+        gru_returns = await load_portfolio_returns_by_id(gru_portfolio_id)
+        if not gru_returns.empty:
+            strategy_returns['GRU_Portfolio'] = gru_returns
+            logger.info(f"✅ Loaded GRU returns: {len(gru_returns)} observations")
+        else:
+            logger.warning(f"⚠️  No GRU returns loaded for portfolio_id: {gru_portfolio_id}")
+        
+        # 2. Load Historical portfolio returns by ID
+        hist_returns = await load_portfolio_returns_by_id(historical_portfolio_id)
+        if not hist_returns.empty:
+            strategy_returns['Historical_Portfolio'] = hist_returns
+            logger.info(f"✅ Loaded Historical returns: {len(hist_returns)} observations")
+        else:
+            logger.warning(f"⚠️  No Historical returns loaded for portfolio_id: {historical_portfolio_id}")
+        
+        # 3. Load Market-weighted portfolio returns from daily_crypto_index
+        market_returns = await load_market_weighted_returns(start_date, end_date)
+        if not market_returns.empty:
+            strategy_returns['Market_Weighted'] = market_returns
+            logger.info(f"✅ Loaded Market returns: {len(market_returns)} observations")
+        else:
+            logger.warning(f"⚠️  No Market returns loaded for period {start_date} to {end_date}")
+        
+        if len(strategy_returns) < 2:
+            raise ValueError(f"Need at least 2 strategies for comparison, got {len(strategy_returns)}")
+        
+        logger.info(f"🔄 Running comprehensive evaluation with {len(strategy_returns)} strategies...")
+        
+        # Run complete evaluation
+        evaluation_results = await run_complete_evaluation(
+            strategy_returns=strategy_returns,
+            output_dir=output_dir,
+            benchmark_strategy='Market_Weighted'  # Use market as benchmark
+        )
+        
+        # Add metadata
+        evaluation_results['comparison_metadata'] = {
+            'gru_portfolio_id': gru_portfolio_id,
+            'historical_portfolio_id': historical_portfolio_id,
+            'comparison_period': f"{start_date} to {end_date}",
+            'strategies_compared': list(strategy_returns.keys()),
+            'benchmark_strategy': 'Market_Weighted',
+            'total_observations': {name: len(returns) for name, returns in strategy_returns.items()},
+            'report_timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"✅ Three-strategy comparison completed! Reports in: {output_dir}")
+        
+        return evaluation_results
+        
+    except Exception as e:
+        logger.error(f"❌ Three-strategy comparison failed: {e}")
         return {'error': str(e)}

@@ -76,17 +76,18 @@ class PortfolioBacktester:
         
         # Fill in rebalancing weights
         for rebalance_date, weights in weights_dict.items():
-            # Convert date to pandas timestamp for indexing
-            rebalance_ts = pd.Timestamp(rebalance_date)
+            # Ensure rebalance_date is a date object for consistent comparison
+            if hasattr(rebalance_date, 'date'):
+                rebalance_date = rebalance_date.date()
             
             # Find the closest date in returns index
-            if rebalance_ts in weights_df.index:
+            if rebalance_date in weights_df.index:
                 for symbol, weight in weights.items():
                     if symbol in weights_df.columns:
-                        weights_df.loc[rebalance_ts, symbol] = weight
+                        weights_df.loc[rebalance_date, symbol] = weight
             else:
                 # Find closest date after rebalance date
-                future_dates = weights_df.index[weights_df.index >= rebalance_ts]
+                future_dates = weights_df.index[weights_df.index >= rebalance_date]
                 if len(future_dates) > 0:
                     closest_date = future_dates[0]
                     for symbol, weight in weights.items():
@@ -94,7 +95,7 @@ class PortfolioBacktester:
                             weights_df.loc[closest_date, symbol] = weight
         
         # Forward fill weights between rebalancing dates
-        weights_df = weights_df.fillna(method='ffill')
+        weights_df = weights_df.ffill()
         
         # Handle initial period before first rebalance
         first_rebalance_idx = None

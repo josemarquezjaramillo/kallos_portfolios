@@ -1,529 +1,237 @@
 """
-Main workflow orchestration for Kallos Portfolios system.
-Implements complete three-strategy portfolio analysis pipeline.
+Kallos Portfolios - Cryptocurrency Portfolio Optimization Package.
+
+Simplified package for portfolio optimization with multiple strategies:
+- GRU-based forecasting
+- Historical returns benchmark  
+- Market-weighted benchmark
 """
 
 import logging
-import logging.config
-import asyncio
-from datetime import date, datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-import pandas as pd
-import yaml
 
-from .config.settings import settings, OptimizationParams, create_run_id
-from .storage import (
-    get_async_session, store_optimization_params, load_optimization_params,
-    fetch_monthly_universe, load_prices_for_period, upsert_weights,
-    load_market_cap_weights, align_market_cap_weights_to_rebalance_dates,
-    store_daily_returns, load_daily_returns
+# Version
+__version__ = "0.1.0"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-from .datasets import (
-    generate_monthly_rebalance_dates, prepare_full_dataset_for_backtest,
-    clean_price_data
-)
-from .models import forecast_returns, validate_model_availability
-from .optimisers import (
-    optimize_portfolio_gru, optimize_portfolio_historical, 
-    create_market_cap_weights, force_sell_non_universe,
-    validate_portfolio_weights
-)
-from .backtest import run_three_strategy_backtest, validate_backtest_data
-from .evaluation import run_complete_evaluation
 
-# Setup logging
-def setup_logging():
-    """Setup logging configuration from YAML file."""
-    logging_config_path = Path(__file__).parent / "config" / "logging.yaml"
+# Import main functionality
+try:
+    from .storage import get_async_session, fetch_monthly_universe, load_prices_for_period
+    from .simulators import GRUPortfolioSimulator, HistoricalPortfolioSimulator
+    from .analysis import run_three_strategy_comparison
+    from .datasets import generate_monthly_rebalance_dates, generate_weekly_rebalance_dates, calculate_returns_matrix
+    from .optimisers import optimize_portfolio_historical, validate_portfolio_weights, OptimizationParams
+    from .backtest import run_backtest, run_three_strategy_backtest
+    from .evaluation import generate_quantstats_reports, create_strategy_comparison_report
     
-    if logging_config_path.exists():
-        with open(logging_config_path, 'r') as f:
-            config = yaml.safe_load(f)
-        logging.config.dictConfig(config)
-    else:
-        # Fallback logging configuration
-        logging.basicConfig(
-            level=getattr(logging, settings.log_level),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
+    # Main workflow function
+    from typing import List
+    from datetime import date
+    import pandas as pd
 
-setup_logging()
-logger = logging.getLogger(__name__)
-
-
-class KallosPortfolioRunner:
-    """
-    Main orchestrator for three-strategy portfolio analysis.
-    
-    Implements complete workflow:
-    1. Setup & Data Loading
-    2. Monthly Universe & Optimization Loop
-    3. Backtesting & Performance Analysis
-    4. Statistical Analysis & Reporting
-    """
-    
-    def __init__(self, database_url: Optional[str] = None):
+    async def run_portfolio(
+        simulation_name: str,
+        assets: List[str],
+        start_date: date,
+        end_date: date,
+        strategies: List[str],
+        initial_investment: float,
+        rebalance_frequency: str
+    ):
         """
-        Initialize portfolio runner.
+        Runs a full portfolio backtest and evaluation for multiple strategies.
         
         Args:
-            database_url: Optional database URL override
-        """
-        self.database_url = database_url or settings.database_url
-        self.model_dir = settings.model_dir
-        self.report_path = settings.report_path
-        
-        # Ensure directories exist
-        self.model_dir.mkdir(exist_ok=True)
-        self.report_path.mkdir(exist_ok=True)
-        
-        logger.info(f"Initialized Kallos Portfolio Runner")
-        logger.info(f"Model directory: {self.model_dir}")
-        logger.info(f"Report directory: {self.report_path}")
-    
-    async def run_portfolio_analysis(
-        self, 
-        run_id: str,
-        params: OptimizationParams
-    ) -> Dict[str, Any]:
-        """
-        Execute complete three-strategy portfolio analysis.
-        
-        Args:
-            run_id: Unique run identifier
-            params: Optimization parameters
+            simulation_name: A unique name for this simulation run.
+            assets: A list of asset IDs (e.g., ['bitcoin', 'ethereum']).
+            start_date: The start date for the backtest.
+            end_date: The end date for the backtest.
+            strategies: A list of strategies to run (e.g., ['equal_weight', 'historical_max_sharpe']).
+            initial_investment: The starting capital for the portfolio.
+            rebalance_frequency: How often to rebalance ('weekly', 'monthly').
             
         Returns:
-            Complete analysis results dictionary
+            A dictionary containing the results, including performance metrics and portfolio value over time.
         """
-        logger.info(f"Starting portfolio analysis for run_id: {run_id}")
+        logging.info(f"Starting portfolio simulation: {simulation_name}")
         
-        try:
-            # Phase 1: Setup & Data Loading
-            results = await self._phase1_setup(run_id, params)
-            if 'error' in results:
-                return results
-            
-            rebalance_dates = results['rebalance_dates']
-            
-            # Phase 2: Monthly Universe & Optimization Loop
-            strategy_weights = await self._phase2_optimization_loop(run_id, params, rebalance_dates)
-            if not strategy_weights:
-                return {'error': 'No strategy weights generated'}
-            
-            # Phase 3: Backtesting & Performance Analysis
-            strategy_returns = await self._phase3_backtesting(run_id, params, strategy_weights, rebalance_dates)
-            if not strategy_returns:
-                return {'error': 'Backtesting failed'}
-            
-            # Phase 4: Statistical Analysis & Reporting
-            evaluation_results = await self._phase4_evaluation(strategy_returns, run_id)
-            
-            # Combine all results
-            final_results = {
-                'run_id': run_id,
-                'parameters': params.dict(),
-                'rebalance_dates': rebalance_dates,
-                'strategy_weights': strategy_weights,
-                'strategy_returns': strategy_returns,
-                'evaluation_results': evaluation_results,
-                'status': 'completed'
-            }
-            
-            logger.info(f"Portfolio analysis completed successfully for run_id: {run_id}")
-            return final_results
-            
-        except Exception as e:
-            logger.error(f"Portfolio analysis failed for run_id {run_id}: {e}")
-            return {'error': str(e), 'run_id': run_id}
-    
-    async def _phase1_setup(self, run_id: str, params: OptimizationParams) -> Dict[str, Any]:
-        """
-        Phase 1: Setup & Data Loading
-        - Store optimization parameters
-        - Generate monthly rebalancing dates
-        - Validate model availability
-        """
-        logger.info("Phase 1: Setup & Data Loading")
-        
-        try:
-            async with get_async_session(self.database_url) as session:
-                # Store optimization parameters
-                success = await store_optimization_params(session, run_id, params)
-                if not success:
-                    return {'error': 'Failed to store optimization parameters'}
+        # Step 1: Global Initialization
+        db_session_factory = get_async_session()
+        async with db_session_factory() as session:
+            try:
+                # 1.1 Generate rebalance schedule
+                if rebalance_frequency == 'weekly':
+                    rebalance_dates = generate_weekly_rebalance_dates(start_date, end_date)
+                else:
+                    rebalance_dates = generate_monthly_rebalance_dates(start_date, end_date)
                 
-                # Generate monthly rebalancing dates
-                start_date = datetime.strptime(params.start_date, '%Y-%m-%d').date()
-                end_date = datetime.strptime(params.end_date, '%Y-%m-%d').date()
+                logging.info(f"Generated {len(rebalance_dates)} rebalance dates")
                 
-                rebalance_dates = generate_monthly_rebalance_dates(start_date, end_date)
+                # 1.2 Load full price history for ALL potential assets
+                all_prices = await load_prices_for_period(
+                    session=session,
+                    start_date=start_date,
+                    end_date=end_date,
+                    assets=None  # Load all assets, we'll filter later
+                )
                 
-                if not rebalance_dates:
-                    return {'error': 'No rebalancing dates generated'}
+                # 1.3 Calculate full returns matrix
+                full_returns = calculate_returns_matrix(all_prices)
+                logging.info(f"Loaded price data for {len(full_returns.columns)} assets")
                 
-                logger.info(f"Generated {len(rebalance_dates)} rebalancing dates from {start_date} to {end_date}")
+                # Step 2: Main Rebalancing Loop (Weekly/Monthly)
+                all_strategy_weights = {strategy: {} for strategy in strategies}
+                current_monthly_universe = []
+                last_processed_month = None
                 
-                # Validate model availability for first universe
-                first_universe = await fetch_monthly_universe(session, rebalance_dates[0])
-                if first_universe:
-                    model_availability = validate_model_availability(self.model_dir, first_universe)
-                    available_models = sum(model_availability.values())
-                    logger.info(f"Model availability: {available_models}/{len(first_universe)} models available")
+                for rebalance_date in rebalance_dates:
+                    logging.info(f"Processing rebalance date: {rebalance_date}")
+                    
+                    # 2.1 Check if month has changed - fetch new universe
+                    current_month = rebalance_date.replace(day=1)  # First day of month
+                    if current_month != last_processed_month:
+                        logging.info(f"Fetching new universe for month: {current_month}")
+                        current_monthly_universe = await fetch_monthly_universe(
+                            session=session, 
+                            rebalance_date=current_month
+                        )
+                        logging.info(f"Universe contains {len(current_monthly_universe)} assets")
+                        last_processed_month = current_month
+                    
+                    # 2.2 Filter returns to current universe only
+                    universe_assets = [asset for asset in current_monthly_universe if asset in full_returns.columns]
+                    if not universe_assets:
+                        logging.warning(f"No assets found in universe for {rebalance_date}")
+                        continue
+                        
+                    returns_for_universe = full_returns[universe_assets]
+                    
+                    # 2.3 Slice historical data up to rebalance date
+                    historical_returns = returns_for_universe.loc[:rebalance_date]
+                    
+                    if historical_returns.empty or len(historical_returns) < 30:  # Need minimum history
+                        logging.warning(f"Insufficient history for {rebalance_date}")
+                        continue
+                    
+                    # 2.4 Optimize for each strategy
+                    for strategy in strategies:
+                        if strategy == 'historical_max_sharpe':
+                            # Call the optimizer with filtered universe data
+                            params = OptimizationParams(objective='max_sharpe')
+                            weights = await optimize_portfolio_historical(
+                                prices=historical_returns,
+                                params=params
+                            )
+                            # Validate weights
+                            validated_weights = validate_portfolio_weights(weights)
+                            all_strategy_weights[strategy][rebalance_date] = validated_weights
+                            
+                        elif strategy == 'equal_weight':
+                            # Simple equal weighting
+                            n_assets = len(universe_assets)
+                            equal_weights = pd.Series(
+                                data=[1.0/n_assets] * n_assets,
+                                index=universe_assets
+                            )
+                            all_strategy_weights[strategy][rebalance_date] = equal_weights
+                            
+                        elif strategy == 'market_cap_weight':
+                            # Market cap weighted (placeholder - would need market cap data)
+                            # For now, use equal weights
+                            n_assets = len(universe_assets)
+                            cap_weights = pd.Series(
+                                data=[1.0/n_assets] * n_assets,
+                                index=universe_assets
+                            )
+                            all_strategy_weights[strategy][rebalance_date] = cap_weights
+                            
+                        else:
+                            raise ValueError(f"Unknown strategy: {strategy}")
                 
-                return {
-                    'rebalance_dates': rebalance_dates,
-                    'start_date': start_date,
-                    'end_date': end_date
+                # Step 3: Vectorized Backtesting
+                logging.info("Running backtests for all strategies")
+                backtest_results = run_three_strategy_backtest(
+                    strategy_weights=all_strategy_weights,
+                    prices=all_prices,
+                    rebalance_dates=rebalance_dates
+                )
+                
+                # Step 4: Performance Evaluation
+                logging.info("Generating performance reports")
+                
+                # Generate individual quantstats reports
+                quantstats_reports = {}
+                for strategy, returns_series in backtest_results.items():
+                    if not returns_series.empty:
+                        report = await generate_quantstats_reports(
+                            portfolio_returns=returns_series,
+                            strategy_name=strategy,
+                            output_path=f"reports/{simulation_name}_{strategy}.html"
+                        )
+                        quantstats_reports[strategy] = report
+                
+                # Create comparison report
+                comparison_report = await create_strategy_comparison_report(
+                    backtest_results=backtest_results,
+                    simulation_name=simulation_name
+                )
+                
+                # Step 5: Final Output
+                final_results = {
+                    'simulation_name': simulation_name,
+                    'strategies': strategies,
+                    'rebalance_dates_count': len(rebalance_dates),
+                    'backtest_results': backtest_results,
+                    'performance_comparison': comparison_report,
+                    'quantstats_reports': quantstats_reports,
+                    'final_portfolio_values': {
+                        strategy: (1 + returns_series).prod() * initial_investment
+                        for strategy, returns_series in backtest_results.items()
+                        if not returns_series.empty
+                    },
+                    'status': 'completed'
                 }
                 
-        except Exception as e:
-            logger.error(f"Phase 1 setup failed: {e}")
-            return {'error': f'Phase 1 setup failed: {e}'}
+                logging.info(f"Successfully completed portfolio simulation: {simulation_name}")
+                return final_results
+                
+            except Exception as e:
+                logging.error(f"Error during portfolio simulation '{simulation_name}': {e}", exc_info=True)
+                await session.rollback()
+                raise
+
+
+    __all__ = [
+        'run_portfolio',
+        'get_async_session',
+        'fetch_monthly_universe', 
+        'load_prices_for_period',
+        'generate_monthly_rebalance_dates',
+        'calculate_returns_matrix',
+        'optimize_portfolio_historical',
+        'validate_portfolio_weights',
+        'run_backtest',
+        'calculate_performance_metrics',
+        'calculate_strategy_metrics',
+        'create_comparison_report'
+    ]
+
+except ImportError as e:
+    logging.warning(f"Some imports failed: {e}")
     
-    async def _phase2_optimization_loop(
-        self, 
-        run_id: str, 
-        params: OptimizationParams, 
-        rebalance_dates: List[date]
-    ) -> Dict[str, Dict[date, pd.Series]]:
-        """
-        Phase 2: Monthly Universe & Optimization Loop
-        - Load monthly universe for each rebalancing date
-        - Generate GRU forecasts and optimize all three strategies
-        - Store portfolio weights
-        """
-        logger.info("Phase 2: Monthly Universe & Optimization Loop")
-        
-        strategy_weights = {
-            'gru': {},
-            'historical': {},
-            'market_cap': {}
+    # Fallback minimal version
+    async def run_portfolio(run_id: str, start_date: str, end_date: str):
+        """Fallback version when imports fail."""
+        return {
+            'run_id': run_id,
+            'start_date': start_date,
+            'end_date': end_date,
+            'status': 'import_error',
+            'error': 'Some module imports failed'
         }
-        
-        try:
-            async with get_async_session(self.database_url) as session:
-                for i, rebalance_date in enumerate(rebalance_dates):
-                    logger.info(f"Processing rebalance {i+1}/{len(rebalance_dates)}: {rebalance_date}")
-                    
-                    # Load monthly universe
-                    monthly_universe = await fetch_monthly_universe(session, rebalance_date)
-                    if not monthly_universe:
-                        logger.warning(f"No universe found for {rebalance_date}, skipping")
-                        continue
-                    
-                    logger.info(f"Universe for {rebalance_date}: {len(monthly_universe)} assets")
-                    
-                    # Load price data for optimization
-                    lookback_start = rebalance_date - pd.Timedelta(days=params.lookback_days + 30)
-                    prices = await load_prices_for_period(
-                        session, monthly_universe, lookback_start.date(), rebalance_date
-                    )
-                    
-                    if prices.empty:
-                        logger.warning(f"No price data for {rebalance_date}, skipping")
-                        continue
-                    
-                    # Clean price data
-                    cleaned_prices = clean_price_data(prices)
-                    if cleaned_prices.empty:
-                        logger.warning(f"No clean price data for {rebalance_date}, skipping")
-                        continue
-                    
-                    # Strategy 1: GRU-optimized portfolio
-                    logger.info(f"Optimizing GRU strategy for {rebalance_date}")
-                    gru_forecasts = await forecast_returns(
-                        cleaned_prices, 
-                        self.model_dir,
-                        lookback_days=30,
-                        max_workers=settings.max_workers
-                    )
-                    
-                    if not gru_forecasts.empty:
-                        gru_weights = await optimize_portfolio_gru(gru_forecasts, cleaned_prices, params)
-                        if not gru_weights.empty:
-                            # Force sell non-universe assets
-                            gru_weights = force_sell_non_universe(gru_weights, monthly_universe)
-                            strategy_weights['gru'][rebalance_date] = gru_weights
-                            
-                            # Store in database
-                            await upsert_weights(session, run_id, rebalance_date, gru_weights, 'gru')
-                    
-                    # Strategy 2: Historical mean optimized portfolio
-                    logger.info(f"Optimizing historical strategy for {rebalance_date}")
-                    historical_weights = await optimize_portfolio_historical(cleaned_prices, params)
-                    if not historical_weights.empty:
-                        # Force sell non-universe assets
-                        historical_weights = force_sell_non_universe(historical_weights, monthly_universe)
-                        strategy_weights['historical'][rebalance_date] = historical_weights
-                        
-                        # Store in database
-                        await upsert_weights(session, run_id, rebalance_date, historical_weights, 'historical')
-                    
-                    # Strategy 3: Market cap weighted portfolio
-                    logger.info(f"Creating market cap weights for {rebalance_date}")
-                    
-                    # Load market cap weights for this month
-                    month_start = rebalance_date.replace(day=1)
-                    month_end = rebalance_date
-                    market_cap_data = await load_market_cap_weights(session, month_start, month_end)
-                    
-                    if market_cap_data:
-                        # Get weights for rebalancing date (or closest available)
-                        available_dates = [d for d in market_cap_data.keys() if d <= rebalance_date]
-                        if available_dates:
-                            closest_date = max(available_dates)
-                            market_cap_weights_raw = market_cap_data[closest_date]
-                            
-                            # Align to universe
-                            market_cap_weights = create_market_cap_weights(market_cap_weights_raw, monthly_universe)
-                            strategy_weights['market_cap'][rebalance_date] = market_cap_weights
-                            
-                            # Store in database
-                            await upsert_weights(session, run_id, rebalance_date, market_cap_weights, 'market_cap')
-                    
-                    # Validate weights
-                    for strategy_name, weights in [
-                        ('gru', strategy_weights['gru'].get(rebalance_date)),
-                        ('historical', strategy_weights['historical'].get(rebalance_date)),
-                        ('market_cap', strategy_weights['market_cap'].get(rebalance_date))
-                    ]:
-                        if weights is not None:
-                            validation = validate_portfolio_weights(weights, params)
-                            if not validation['valid']:
-                                logger.warning(f"Invalid weights for {strategy_name} on {rebalance_date}: {validation}")
-                
-                logger.info(f"Optimization loop completed: {len(strategy_weights['gru'])} GRU, "
-                          f"{len(strategy_weights['historical'])} historical, "
-                          f"{len(strategy_weights['market_cap'])} market cap portfolios")
-                
-                return strategy_weights
-                
-        except Exception as e:
-            logger.error(f"Phase 2 optimization loop failed: {e}")
-            return {}
     
-    async def _phase3_backtesting(
-        self,
-        run_id: str,
-        params: OptimizationParams,
-        strategy_weights: Dict[str, Dict[date, pd.Series]],
-        rebalance_dates: List[date]
-    ) -> Dict[str, pd.Series]:
-        """
-        Phase 3: Backtesting & Performance Analysis
-        - Load complete price dataset for backtesting period
-        - Run vectorized backtests for all strategies
-        - Store daily returns
-        """
-        logger.info("Phase 3: Backtesting & Performance Analysis")
-        
-        try:
-            async with get_async_session(self.database_url) as session:
-                # Get all symbols from strategy weights
-                all_symbols = set()
-                for strategy_dict in strategy_weights.values():
-                    for weights in strategy_dict.values():
-                        all_symbols.update(weights.index)
-                
-                all_symbols = sorted(list(all_symbols))
-                logger.info(f"Loading prices for {len(all_symbols)} symbols for backtesting")
-                
-                # Load complete price dataset for backtesting
-                start_date = datetime.strptime(params.start_date, '%Y-%m-%d').date()
-                end_date = datetime.strptime(params.end_date, '%Y-%m-%d').date()
-                
-                # Add buffer for initial lookback
-                extended_start = start_date - pd.Timedelta(days=60)
-                
-                prices = await load_prices_for_period(
-                    session, all_symbols, extended_start.date(), end_date
-                )
-                
-                if prices.empty:
-                    logger.error("No price data loaded for backtesting")
-                    return {}
-                
-                # Clean price data
-                cleaned_prices = clean_price_data(prices)
-                
-                # Validate backtest data
-                validation = validate_backtest_data(cleaned_prices, strategy_weights, rebalance_dates)
-                if not validation['valid']:
-                    logger.error(f"Backtest validation failed: {validation['errors']}")
-                    if validation['warnings']:
-                        logger.warning(f"Backtest warnings: {validation['warnings']}")
-                
-                # Run three-strategy backtest
-                logger.info("Running vectorized backtests for all strategies")
-                strategy_returns = run_three_strategy_backtest(
-                    strategy_weights, cleaned_prices, rebalance_dates
-                )
-                
-                if not strategy_returns:
-                    logger.error("No strategy returns generated from backtesting")
-                    return {}
-                
-                # Convert to dictionary format for database storage
-                returns_dict = {}
-                for strategy_name, returns_series in strategy_returns.items():
-                    returns_dict[strategy_name] = {}
-                    for timestamp, return_value in returns_series.items():
-                        if pd.notna(return_value):
-                            date_key = timestamp.date() if hasattr(timestamp, 'date') else timestamp
-                            returns_dict[strategy_name][date_key] = float(return_value)
-                
-                # Store daily returns in database
-                logger.info("Storing daily returns in database")
-                await store_daily_returns(session, run_id, returns_dict)
-                
-                logger.info(f"Backtesting completed for {len(strategy_returns)} strategies")
-                return strategy_returns
-                
-        except Exception as e:
-            logger.error(f"Phase 3 backtesting failed: {e}")
-            return {}
-    
-    async def _phase4_evaluation(
-        self,
-        strategy_returns: Dict[str, pd.Series],
-        run_id: str
-    ) -> Dict[str, Any]:
-        """
-        Phase 4: Statistical Analysis & Reporting
-        - Generate comprehensive performance metrics
-        - Execute pairwise hypothesis tests
-        - Create QuantStats tearsheets and comparison reports
-        """
-        logger.info("Phase 4: Statistical Analysis & Reporting")
-        
-        try:
-            # Create run-specific report directory
-            run_report_dir = self.report_path / run_id
-            run_report_dir.mkdir(exist_ok=True)
-            
-            # Run complete evaluation
-            evaluation_results = await run_complete_evaluation(
-                strategy_returns,
-                output_dir=run_report_dir,
-                benchmark_strategy='market_cap'
-            )
-            
-            if 'error' in evaluation_results:
-                logger.error(f"Evaluation failed: {evaluation_results['error']}")
-                return evaluation_results
-            
-            logger.info(f"Evaluation completed successfully")
-            logger.info(f"Reports generated in: {run_report_dir}")
-            
-            return evaluation_results
-            
-        except Exception as e:
-            logger.error(f"Phase 4 evaluation failed: {e}")
-            return {'error': str(e)}
-
-
-# Convenience functions for external use
-async def run_portfolio(
-    run_id: Optional[str] = None,
-    params: Optional[OptimizationParams] = None,
-    database_url: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Convenience function to run complete portfolio analysis.
-    
-    Args:
-        run_id: Optional run identifier (generated if not provided)
-        params: Optional optimization parameters (loaded from DB if not provided)
-        database_url: Optional database URL override
-        
-    Returns:
-        Complete analysis results
-    """
-    if run_id is None:
-        run_id = create_run_id("portfolio_analysis")
-    
-    runner = KallosPortfolioRunner(database_url)
-    
-    if params is None:
-        # Try to load from database
-        async with get_async_session(database_url) as session:
-            params = await load_optimization_params(session, run_id)
-            if params is None:
-                raise ValueError(f"No optimization parameters found for run_id: {run_id}")
-    
-    return await runner.run_portfolio_analysis(run_id, params)
-
-
-async def run_portfolio_with_config(
-    config_dict: Dict[str, Any],
-    run_id: Optional[str] = None,
-    database_url: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Run portfolio analysis with configuration dictionary.
-    
-    Args:
-        config_dict: Configuration dictionary with optimization parameters
-        run_id: Optional run identifier
-        database_url: Optional database URL override
-        
-    Returns:
-        Complete analysis results
-    """
-    if run_id is None:
-        run_id = create_run_id("portfolio_config")
-    
-    # Create OptimizationParams from config
-    params = OptimizationParams(**config_dict)
-    
-    runner = KallosPortfolioRunner(database_url)
-    return await runner.run_portfolio_analysis(run_id, params)
-
-
-def create_example_config() -> Dict[str, Any]:
-    """
-    Create example configuration for portfolio optimization.
-    
-    Returns:
-        Example configuration dictionary
-    """
-    return {
-        'objective': 'max_sharpe',
-        'max_weight': 0.35,
-        'min_names': 3,
-        'l2_reg': 0.01,
-        'risk_free_rate': 0.0,
-        'gamma': 1.0,
-        'lookback_days': 252,
-        'start_date': '2023-01-01',
-        'end_date': '2023-12-31'
-    }
-
-
-def get_system_info() -> Dict[str, Any]:
-    """
-    Get system information and configuration.
-    
-    Returns:
-        Dictionary with system information
-    """
-    return {
-        'version': '1.0.0',
-        'strategies': ['gru', 'historical', 'market_cap'],
-        'model_dir': settings.model_dir,
-        'database_url': settings.database_url,
-        'log_level': settings.log_level
-    }
-
-
-# Export main functions
-__all__ = [
-    'KallosPortfolioRunner',
-    'run_portfolio',
-    'run_portfolio_with_config',
-    'create_example_config',
-    'get_system_info',
-    'setup_logging'
-]
+    __all__ = ['run_portfolio']
