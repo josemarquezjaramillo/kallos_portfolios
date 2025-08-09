@@ -153,16 +153,14 @@ class BasePortfolioSimulator:
             
             # Create optimization parameters
             params = OptimizationParams(
-                expected_returns=expected_returns_aligned,
-                returns_data=returns_for_cov,
                 objective=self.objective,
                 max_weight=0.4,  # Maximum 40% allocation to any single asset
                 min_weight=0.01   # Minimum 1% allocation if included
             )
             
-            # Run optimization
+            # Run optimization using the correct method
             optimizer = PortfolioOptimizer(params)
-            result = optimizer.optimize()
+            result = optimizer._optimize_portfolio_base(expected_returns_aligned, returns_for_cov)
             
             if result is None or result.empty:
                 logger.warning(f"⚠️  Portfolio optimization failed for {target_date}")
@@ -225,7 +223,11 @@ class BasePortfolioSimulator:
     
     async def simulate_performance(self, weekly_weights: Dict[date, pd.Series]) -> Dict:
         """
-        Simulate portfolio performance using VectorBT with realistic rebalancing.
+        Simulate portfolio performance using VectorBT with realistic weight drift.
+        
+        Weights only change on rebalancing dates, but the portfolio value
+        changes daily based on price movements of the underlying assets.
+        This creates realistic portfolio drift between rebalancing dates.
         
         Args:
             weekly_weights: Dictionary mapping rebalancing dates to portfolio weights
@@ -233,7 +235,7 @@ class BasePortfolioSimulator:
         Returns:
             Dictionary containing performance results and metrics
         """
-        logger.info("🎯 Simulating portfolio performance with VectorBT...")
+        logger.info("🎯 Simulating portfolio performance with VectorBT and natural weight drift...")
         
         if not weekly_weights:
             raise ValueError("No portfolio weights provided for simulation")
@@ -265,26 +267,51 @@ class BasePortfolioSimulator:
         
         logger.info(f"📊 Loaded price data: {price_data.shape} (dates × assets)")
         
-        # Create rebalancing signals and weights DataFrames
-        rebalance_signals = pd.DataFrame(False, index=price_data.index, columns=all_assets)
-        weights_df = pd.DataFrame(0.0, index=price_data.index, columns=all_assets)
+        # Create weight matrix for rebalancing approach
+        # We'll use VectorBT's built-in rebalancing functionality
+        logger.info("📊 Creating rebalancing portfolio simulation...")
         
-        # Set rebalancing signals and weights
+        # Create price matrix (ensure proper ordering)
+        price_matrix = price_data
+        
+        # Create target allocations only on rebalancing dates
+        target_allocations = pd.DataFrame(
+            0.0,  # Initialize with zeros
+            index=price_matrix.index,
+            columns=all_assets
+        )
+        
+        # Set target allocations on rebalancing dates
+        rebalancing_count = 0
         for rebal_date, weights in weekly_weights.items():
-            if rebal_date in price_data.index:
-                rebalance_signals.loc[rebal_date, :] = True
-                for asset, weight in weights.items():
-                    if asset in weights_df.columns:
-                        weights_df.loc[rebal_date, asset] = weight
-                
-                logger.debug(f"📅 {rebal_date}: Set {len(weights)} weights")
+            if rebal_date in target_allocations.index:
+                for asset in all_assets:
+                    target_allocations.loc[rebal_date, asset] = weights.get(asset, 0.0)
+                rebalancing_count += 1
+                logger.debug(f"📅 {rebal_date}: Set target allocations for {len(weights)} assets")
         
-        # Run VectorBT simulation
+        logger.info(f"📊 Set target allocations for {rebalancing_count} rebalancing dates")
         logger.info("🚀 Running VectorBT portfolio simulation...")
         
-        portfolio = vbt.Portfolio.from_orders(
-            price_data,
-            size=weights_df,
+        # Use VectorBT's Portfolio.from_holding_value for proper rebalancing
+        # This approach ensures portfolio drifts between rebalancing dates
+        try:
+            portfolio = vbt.Portfolio.from_holding_value(
+                price_matrix,
+                target_allocations,
+                group_by=True,
+                cash_sharing=True,
+                call_seq='auto',
+                freq='1D'
+            )
+        except Exception as e:
+            logger.warning(f"from_holding_value failed: {e}, falling back to from_orders")
+            # Fallback to from_orders with sparse weights
+            sparse_weights = target_allocations.replace(0.0, np.nan)
+            
+            portfolio = vbt.Portfolio.from_orders(
+                price_matrix,
+                size=sparse_weights,
             size_type='targetpercent',  # Target percentage allocation
             group_by=True,              # Treat as single portfolio
             cash_sharing=True,          # Share cash across all assets
@@ -383,10 +410,14 @@ class BasePortfolioSimulator:
                         returns_dict[date_idx.date() if hasattr(date_idx, 'date') else date_idx] = float(return_val)
                 
                 if returns_dict:
+                    # Convert returns dict to Series for the storage function
+                    returns_series = pd.Series(returns_dict)
+                    returns_series.index = pd.to_datetime(returns_series.index)
+                    
                     await save_portfolio_returns(
                         session=session,
                         portfolio_run_id=portfolio_run_id,
-                        returns=returns_dict
+                        returns_series=returns_series
                     )
                 
                 logger.info(f"✅ Saved portfolio run: {run_id} (ID: {portfolio_run_id})")

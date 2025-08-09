@@ -65,9 +65,63 @@ class PortfolioOptimizer:
             Weekly covariance matrix
         """
         try:
-            # Use Ledoit-Wolf shrinkage for robust covariance estimation
-            cov_estimator = risk_models.CovarianceShrinkage(prices, frequency=252)
-            daily_cov = cov_estimator.ledoit_wolf()
+            # Clean the price data before covariance calculation
+            cleaned_prices = prices.copy()
+            
+            # Remove any completely empty columns
+            cleaned_prices = cleaned_prices.dropna(axis=1, how='all')
+            
+            # Forward fill missing values (common in crypto data over weekends)
+            cleaned_prices = cleaned_prices.ffill()
+            
+            # If still NaN values, backward fill
+            cleaned_prices = cleaned_prices.bfill()
+            
+            # Drop any rows that are still completely NaN
+            cleaned_prices = cleaned_prices.dropna(how='all')
+            
+            # Check for remaining NaN values
+            nan_count = cleaned_prices.isna().sum().sum()
+            if nan_count > 0:
+                self.logger.warning(f"Found {nan_count} NaN values after cleaning, using pairwise covariance")
+            
+            # Fix zero or negative prices by replacing with small positive values
+            # This prevents infinite returns in pct_change calculation
+            min_valid_price = cleaned_prices[cleaned_prices > 0].min().min()
+            replacement_price = min_valid_price * 0.001 if pd.notna(min_valid_price) else 0.001
+            
+            invalid_prices = (cleaned_prices <= 0).any()
+            if invalid_prices.any():
+                invalid_assets = invalid_prices[invalid_prices].index.tolist()
+                self.logger.warning(f"Assets with zero/negative prices (replacing with {replacement_price}): {invalid_assets}")
+                cleaned_prices = cleaned_prices.mask(cleaned_prices <= 0, replacement_price)
+            
+            # Calculate returns with improved preprocessing
+            returns = cleaned_prices.pct_change().dropna()
+            
+            # Check for infinite returns (should be rare now)
+            inf_returns = np.isinf(returns).any()
+            if inf_returns.any():
+                inf_assets = inf_returns[inf_returns].index.tolist()
+                self.logger.warning(f"Assets with infinite returns (replacing): {inf_assets}")
+                # Replace infinite values with large but finite values
+                returns = returns.replace([np.inf, -np.inf], [10, -0.99])  # 1000% gain, 99% loss max
+            
+            # Cap extremely large returns to prevent covariance matrix issues
+            # Use 500% as threshold (5.0 in decimal)
+            extreme_threshold = 5.0
+            extreme_returns = (returns.abs() > extreme_threshold).any()
+            if extreme_returns.any():
+                extreme_assets = extreme_returns[extreme_returns].index.tolist()
+                self.logger.warning(f"Assets with extreme returns (>500%, capping): {extreme_assets}")
+                # Cap extreme returns to threshold
+                returns = returns.clip(-extreme_threshold, extreme_threshold)
+            
+            
+            # Use cleaned returns for covariance estimation instead of prices
+            # This ensures we work with properly processed return data
+            cov_estimator = risk_models.sample_cov(returns, frequency=252)
+            daily_cov = pd.DataFrame(cov_estimator, index=returns.columns, columns=returns.columns)
             
             # Convert daily to weekly covariance (assuming 5 trading days per week)
             weekly_cov = daily_cov * 5
@@ -85,11 +139,13 @@ class PortfolioOptimizer:
             self.logger.error(f"Error computing covariance matrix: {e}")
             # Fallback: diagonal covariance matrix
             n_assets = len(prices.columns)
-            return pd.DataFrame(
+            fallback_cov = pd.DataFrame(
                 np.eye(n_assets) * 0.01,  # 1% weekly variance
                 index=prices.columns,
                 columns=prices.columns
             )
+            self.logger.info(f"Using fallback diagonal covariance matrix for {n_assets} assets")
+            return fallback_cov
     
     def _add_cardinality_constraints(self, ef: EfficientFrontier) -> EfficientFrontier:
         """

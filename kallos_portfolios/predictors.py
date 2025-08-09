@@ -51,6 +51,7 @@ def match_rebalancing_to_models(rebalancing_dates: List[date], model_definitions
     if matched_data:
         result_df = pd.concat(matched_data, ignore_index=True)
         logger.info(f"Matched {len(result_df)} model-rebalancing combinations")
+        result_df = result_df.drop_duplicates()
         return result_df
     else:
         logger.warning("No matching model-rebalancing combinations found")

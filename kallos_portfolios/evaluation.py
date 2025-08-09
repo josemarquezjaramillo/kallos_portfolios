@@ -520,9 +520,18 @@ def _generate_comparison_html(
         if 'error' in test_data:
             continue
         
+        # Fix the strategy name formatting
+        strategy_a = test_data.get('strategy_a', '')
+        strategy_b = test_data.get('strategy_b', '')
+        
+        # Create proper display names
+        display_name_a = strategy_a.replace('_', ' ')
+        display_name_b = strategy_b.replace('_', ' ')
+        comparison_title = f"{display_name_a} vs. {display_name_b}"
+        
         html += f"""
         <div class="test-section">
-            <h3>{pair_name.replace('_', ' vs ')}</h3>
+            <h3>{comparison_title}</h3>
             <p><strong>Sample Size:</strong> {test_data['sample_size']} observations</p>
         """
         

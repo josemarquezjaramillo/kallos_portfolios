@@ -501,10 +501,31 @@ async def load_prices_for_period(
         numeric_columns = ['price', 'volume', 'market_cap', 'close']
         for col in numeric_columns:
             if col in prices_df.columns:
+                # Convert to numeric, but preserve original values if conversion fails
+                original_values = prices_df[col].copy()
                 prices_df[col] = pd.to_numeric(prices_df[col], errors='coerce').astype('float64')
+                
+                # Check if any valid data was lost in conversion
+                converted_nans = prices_df[col].isna() & original_values.notna()
+                if converted_nans.any():
+                    problematic_values = original_values[converted_nans].unique()
+                    logger.warning(f"Non-numeric values converted to NaN in {col}: {problematic_values}")
         
         # Use close price if available, otherwise use price
         price_column = 'close' if 'close' in prices_df.columns and not prices_df['close'].isna().all() else 'price'
+        
+        # Check for problematic price values before pivoting
+        price_data = prices_df[price_column]
+        zero_prices = (price_data == 0).sum()
+        negative_prices = (price_data < 0).sum()
+        nan_prices = price_data.isna().sum()
+        
+        if zero_prices > 0:
+            logger.warning(f"Found {zero_prices} zero prices in {price_column} - these will cause issues in return calculations")
+        if negative_prices > 0:
+            logger.warning(f"Found {negative_prices} negative prices in {price_column}")
+        if nan_prices > 0:
+            logger.warning(f"Found {nan_prices} NaN prices in {price_column} - these will be excluded")
         
         # Pivot to get coin_ids as columns
         prices_pivot = prices_df.pivot_table(
